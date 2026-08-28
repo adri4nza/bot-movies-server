@@ -263,51 +263,65 @@ async def download_episode(episode_id: int) -> str:
 
 
 # ── Declaración de tools para Gemini (function calling) ────
+# Usamos types.Schema con enums types.Type (formato canónico y el más
+# compatible entre versiones del SDK) en lugar de parameters_json_schema.
 
 FUNCTION_DECLARATIONS = [
     types.FunctionDeclaration(
         name="search_movie",
         description="Busca películas por nombre. Usar cuando el usuario quiere una película.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Nombre de la película a buscar"}
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "query": types.Schema(
+                    type=types.Type.STRING,
+                    description="Nombre de la película a buscar",
+                ),
             },
-            "required": ["query"],
-        },
+            required=["query"],
+        ),
     ),
     types.FunctionDeclaration(
         name="add_movie",
         description="Agrega una película para descargar. Usar después de confirmar cuál quiere el usuario.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "tmdb_id": {"type": "integer", "description": "TMDB ID de la película"}
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "tmdb_id": types.Schema(
+                    type=types.Type.INTEGER,
+                    description="TMDB ID de la película",
+                ),
             },
-            "required": ["tmdb_id"],
-        },
+            required=["tmdb_id"],
+        ),
     ),
     types.FunctionDeclaration(
         name="search_series",
         description="Busca series de TV por nombre.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Nombre de la serie a buscar"}
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "query": types.Schema(
+                    type=types.Type.STRING,
+                    description="Nombre de la serie a buscar",
+                ),
             },
-            "required": ["query"],
-        },
+            required=["query"],
+        ),
     ),
     types.FunctionDeclaration(
         name="add_series",
         description="Agrega una serie completa para descargar.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "tvdb_id": {"type": "integer", "description": "TVDB ID de la serie"}
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "tvdb_id": types.Schema(
+                    type=types.Type.INTEGER,
+                    description="TVDB ID de la serie",
+                ),
             },
-            "required": ["tvdb_id"],
-        },
+            required=["tvdb_id"],
+        ),
     ),
     types.FunctionDeclaration(
         name="search_episode",
@@ -315,31 +329,42 @@ FUNCTION_DECLARATIONS = [
             "Busca un episodio específico de una serie que ya está en Sonarr. "
             "Usar cuando el usuario pide un capítulo puntual."
         ),
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "tvdb_id": {"type": "integer", "description": "TVDB ID de la serie"},
-                "season": {"type": "integer", "description": "Número de temporada"},
-                "episode": {"type": "integer", "description": "Número de episodio"},
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "tvdb_id": types.Schema(
+                    type=types.Type.INTEGER, description="TVDB ID de la serie"
+                ),
+                "season": types.Schema(
+                    type=types.Type.INTEGER, description="Número de temporada"
+                ),
+                "episode": types.Schema(
+                    type=types.Type.INTEGER, description="Número de episodio"
+                ),
             },
-            "required": ["tvdb_id", "season", "episode"],
-        },
+            required=["tvdb_id", "season", "episode"],
+        ),
     ),
     types.FunctionDeclaration(
         name="download_episode",
         description="Descarga un episodio específico. Usar después de search_episode cuando el usuario confirme.",
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "episode_id": {
-                    "type": "integer",
-                    "description": "ID del episodio en Sonarr (obtenido de search_episode)",
-                }
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "episode_id": types.Schema(
+                    type=types.Type.INTEGER,
+                    description="ID del episodio en Sonarr (obtenido de search_episode)",
+                ),
             },
-            "required": ["episode_id"],
-        },
+            required=["episode_id"],
+        ),
     ),
 ]
+
+# El objeto Tool que agrupa todas las function declarations. Se inyecta en
+# CADA petición a Gemini (dentro de config); sin esto el modelo no sabe que
+# tiene herramientas y responde como un chatbot común.
+MEDIA_TOOL = types.Tool(function_declarations=FUNCTION_DECLARATIONS)
 
 SYSTEM_PROMPT = """Sos un asistente de media server. Ayudás al usuario a buscar y descargar
 películas y series.
@@ -371,14 +396,28 @@ Reglas:
 - Todo se descarga en 1080p automáticamente
 """
 
-GENERATE_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
-    temperature=0.3,
-    # No pasamos callables de Python, así que Gemini nunca ejecuta nada por su
-    # cuenta: siempre devuelve function_calls y el bot controla la ejecución.
-    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-)
+def build_config() -> types.GenerateContentConfig:
+    """
+    Construye un GenerateContentConfig nuevo por cada petición.
+
+    Se crea fresco (en vez de reutilizar un singleton) para evitar cualquier
+    mutación interna del SDK compartida entre peticiones concurrentes. Lo clave
+    es que SIEMPRE incluye `tools=[MEDIA_TOOL]`: así el esquema de herramientas
+    viaja en cada llamada a generate_content y Gemini emite function_call.
+    """
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        tools=[MEDIA_TOOL],
+        temperature=0.3,
+        # Modo AUTO: el modelo decide cuándo llamar una tool (recomendado para
+        # un flujo conversacional donde a veces solo hay que responder texto).
+        tool_config=types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(mode="AUTO")
+        ),
+        # No pasamos callables de Python, así que Gemini nunca ejecuta nada por
+        # su cuenta: siempre devuelve function_calls y el bot controla la ejecución.
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
 
 
 # ── Dispatch de tools ──────────────────────────────────────
@@ -462,10 +501,11 @@ async def process_with_gemini(chat_id: int, user_message: str) -> str:
     )
     _trim_history(history)
 
+    config = build_config()
     response = await gemini.aio.models.generate_content(
         model=GEMINI_MODEL,
         contents=history,
-        config=GENERATE_CONFIG,
+        config=config,
     )
 
     # Loop de function calling controlado por nosotros.
@@ -494,7 +534,7 @@ async def process_with_gemini(chat_id: int, user_message: str) -> str:
         response = await gemini.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=history,
-            config=GENERATE_CONFIG,
+            config=config,
         )
 
     final_text = (response.text or "").strip()
