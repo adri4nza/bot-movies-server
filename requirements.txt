@@ -1,0 +1,8 @@
+# SDK oficial de Google GenAI (Gemini). Pineado <3.0 por cambios anunciados en AFC.
+google-genai>=1.16,<3.0
+
+# httpx con el extra socks para poder usar el proxy SOCKS5 de Warp.
+httpx[socks]>=0.27,<0.29
+
+# Bot de Telegram (API async v20+: ApplicationBuilder / run_polling).
+python-telegram-bot>=21,<22

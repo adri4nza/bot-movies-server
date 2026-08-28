@@ -1,8 +1,12 @@
 import os
 import json
+import asyncio
 import logging
+from collections import defaultdict
+
 import httpx
-import anthropic
+from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -12,63 +16,87 @@ from telegram.ext import (
     ContextTypes,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("media-bot")
 
 # ── Configuración ──────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-RADARR_URL = os.environ.get("RADARR_URL", "http://radarr:7878")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+RADARR_URL = os.environ.get("RADARR_URL", "http://radarr:7878").rstrip("/")
 RADARR_API_KEY = os.environ["RADARR_API_KEY"]
-SONARR_URL = os.environ.get("SONARR_URL", "http://sonarr:8989")
+SONARR_URL = os.environ.get("SONARR_URL", "http://sonarr:8989").rstrip("/")
 SONARR_API_KEY = os.environ["SONARR_API_KEY"]
 
-client = anthropic.Anthropic(
-    http_client=httpx.Client(
-        proxy="socks5://warp:1080",
-        timeout=30,
-    )
+# Proxy SOCKS (Warp). Solo se aplica al tráfico hacia Google/Gemini.
+WARP_PROXY = os.environ.get("WARP_PROXY", "socks5://warp:1080")
+HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
+
+# Cliente Gemini: async, con todo el tráfico saliendo por el proxy Warp.
+# Requiere httpx[socks] para el esquema socks5://.
+gemini = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(
+        client_args={"proxy": WARP_PROXY},
+        async_client_args={"proxy": WARP_PROXY},
+        timeout=int(HTTP_TIMEOUT * 1000),  # ms
+    ),
 )
-http = httpx.Client(timeout=30)
 
-# ── Funciones de Radarr / Sonarr ───────────────────────────
+# Cliente HTTP async para Radarr/Sonarr (red local, sin proxy).
+arr = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
-def search_movie(query: str) -> list[dict]:
+RADARR_HEADERS = {"X-Api-Key": RADARR_API_KEY}
+SONARR_HEADERS = {"X-Api-Key": SONARR_API_KEY}
+
+
+# ── Funciones de Radarr / Sonarr (async) ───────────────────
+
+async def search_movie(query: str) -> list[dict]:
     """Busca películas en Radarr vía TMDB."""
-    resp = http.get(
+    resp = await arr.get(
         f"{RADARR_URL}/api/v3/movie/lookup",
         params={"term": query},
-        headers={"X-Api-Key": RADARR_API_KEY},
+        headers=RADARR_HEADERS,
     )
     resp.raise_for_status()
     results = resp.json()[:5]
     return [
         {
-            "title": m["title"],
+            "title": m.get("title"),
             "year": m.get("year"),
-            "tmdbId": m["tmdbId"],
-            "overview": m.get("overview", "")[:200],
+            "tmdbId": m.get("tmdbId"),
+            "overview": (m.get("overview") or "")[:200],
         }
         for m in results
     ]
 
 
-def add_movie(tmdb_id: int, quality_profile_id: int = 1) -> str:
+async def add_movie(tmdb_id: int, quality_profile_id: int = 1) -> str:
     """Agrega una película a Radarr para descarga."""
-    # Primero obtener datos completos
-    lookup = http.get(
+    lookup = await arr.get(
         f"{RADARR_URL}/api/v3/movie/lookup/tmdb",
         params={"tmdbId": tmdb_id},
-        headers={"X-Api-Key": RADARR_API_KEY},
+        headers=RADARR_HEADERS,
     )
     lookup.raise_for_status()
     movie_data = lookup.json()
+    if not movie_data:
+        return "No encontré datos para ese TMDB ID en Radarr."
 
-    # Obtener root folder
-    folders = http.get(
+    folders_resp = await arr.get(
         f"{RADARR_URL}/api/v3/rootfolder",
-        headers={"X-Api-Key": RADARR_API_KEY},
+        headers=RADARR_HEADERS,
     )
-    root_path = folders.json()[0]["path"]
+    folders_resp.raise_for_status()
+    folders = folders_resp.json()
+    if not folders:
+        return "Radarr no tiene ninguna carpeta raíz configurada. Configurala primero."
+    root_path = folders[0]["path"]
 
     payload = {
         "title": movie_data["title"],
@@ -77,13 +105,13 @@ def add_movie(tmdb_id: int, quality_profile_id: int = 1) -> str:
         "qualityProfileId": quality_profile_id,
         "rootFolderPath": root_path,
         "monitored": True,
-        "addOptions": {"searchForMovie": True},  # Busca torrent de inmediato
+        "addOptions": {"searchForMovie": True},
     }
 
-    resp = http.post(
+    resp = await arr.post(
         f"{RADARR_URL}/api/v3/movie",
         json=payload,
-        headers={"X-Api-Key": RADARR_API_KEY},
+        headers=RADARR_HEADERS,
     )
     if resp.status_code == 400 and "already been added" in resp.text.lower():
         return f"'{movie_data['title']}' ya está en tu biblioteca."
@@ -91,41 +119,48 @@ def add_movie(tmdb_id: int, quality_profile_id: int = 1) -> str:
     return f"'{movie_data['title']}' agregada. Radarr buscará y descargará automáticamente."
 
 
-def search_series(query: str) -> list[dict]:
+async def search_series(query: str) -> list[dict]:
     """Busca series en Sonarr vía TVDB."""
-    resp = http.get(
+    resp = await arr.get(
         f"{SONARR_URL}/api/v3/series/lookup",
         params={"term": query},
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     resp.raise_for_status()
     results = resp.json()[:5]
     return [
         {
-            "title": s["title"],
+            "title": s.get("title"),
             "year": s.get("year"),
-            "tvdbId": s["tvdbId"],
-            "overview": s.get("overview", "")[:200],
+            "tvdbId": s.get("tvdbId"),
+            "overview": (s.get("overview") or "")[:200],
         }
         for s in results
     ]
 
 
-def add_series(tvdb_id: int, quality_profile_id: int = 1) -> str:
+async def add_series(tvdb_id: int, quality_profile_id: int = 1) -> str:
     """Agrega una serie a Sonarr para descarga."""
-    lookup = http.get(
+    lookup = await arr.get(
         f"{SONARR_URL}/api/v3/series/lookup",
         params={"term": f"tvdb:{tvdb_id}"},
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     lookup.raise_for_status()
-    series_data = lookup.json()[0]
+    data = lookup.json()
+    if not data:
+        return "No encontré esa serie en Sonarr con ese TVDB ID."
+    series_data = data[0]
 
-    folders = http.get(
+    folders_resp = await arr.get(
         f"{SONARR_URL}/api/v3/rootfolder",
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
-    root_path = folders.json()[0]["path"]
+    folders_resp.raise_for_status()
+    folders = folders_resp.json()
+    if not folders:
+        return "Sonarr no tiene ninguna carpeta raíz configurada. Configurala primero."
+    root_path = folders[0]["path"]
 
     payload = {
         "title": series_data["title"],
@@ -137,22 +172,22 @@ def add_series(tvdb_id: int, quality_profile_id: int = 1) -> str:
         "addOptions": {"searchForMissingEpisodes": True},
     }
 
-    resp = http.post(
+    resp = await arr.post(
         f"{SONARR_URL}/api/v3/series",
         json=payload,
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     if resp.status_code == 400 and "already been added" in resp.text.lower():
         return f"'{series_data['title']}' ya está en tu biblioteca."
     resp.raise_for_status()
     return f"'{series_data['title']}' agregada. Sonarr buscará y descargará automáticamente."
 
-def search_episode(tvdb_id: int, season: int, episode: int) -> dict:
-    """Busca un episodio específico de una serie en Sonarr."""
-    # Primero verificar si la serie ya está en Sonarr
-    resp = http.get(
+
+async def search_episode(tvdb_id: int, season: int, episode: int) -> dict:
+    """Busca un episodio específico de una serie que ya está en Sonarr."""
+    resp = await arr.get(
         f"{SONARR_URL}/api/v3/series",
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     resp.raise_for_status()
     series_list = resp.json()
@@ -168,11 +203,10 @@ def search_episode(tvdb_id: int, season: int, episode: int) -> dict:
     if not series_id:
         return {"error": "La serie no está en Sonarr. Primero agregala con add_series."}
 
-    # Buscar el episodio
-    resp = http.get(
+    resp = await arr.get(
         f"{SONARR_URL}/api/v3/episode",
         params={"seriesId": series_id},
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     resp.raise_for_status()
     episodes = resp.json()
@@ -192,126 +226,109 @@ def search_episode(tvdb_id: int, season: int, episode: int) -> dict:
     return {"error": f"No se encontró S{season:02d}E{episode:02d} de {series_title}."}
 
 
-def download_episode(episode_id: int) -> str:
+async def download_episode(episode_id: int) -> str:
     """Fuerza la búsqueda y descarga de un episodio específico."""
-    # Marcar como monitoreado
-    ep_resp = http.get(
+    ep_resp = await arr.get(
         f"{SONARR_URL}/api/v3/episode/{episode_id}",
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     ep_resp.raise_for_status()
     ep_data = ep_resp.json()
 
     if ep_data.get("hasFile"):
-        return f"'{ep_data.get('title', '')}' (S{ep_data['seasonNumber']:02d}E{ep_data['episodeNumber']:02d}) ya está descargado."
+        return (
+            f"'{ep_data.get('title', '')}' "
+            f"(S{ep_data['seasonNumber']:02d}E{ep_data['episodeNumber']:02d}) ya está descargado."
+        )
 
-    # Activar monitoreo del episodio
     ep_data["monitored"] = True
-    http.put(
+    put_resp = await arr.put(
         f"{SONARR_URL}/api/v3/episode/{episode_id}",
         json=ep_data,
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
+    put_resp.raise_for_status()
 
-    # Lanzar búsqueda del episodio
-    command = {
-        "name": "EpisodeSearch",
-        "episodeIds": [episode_id],
-    }
-    resp = http.post(
+    command = {"name": "EpisodeSearch", "episodeIds": [episode_id]}
+    resp = await arr.post(
         f"{SONARR_URL}/api/v3/command",
         json=command,
-        headers={"X-Api-Key": SONARR_API_KEY},
+        headers=SONARR_HEADERS,
     )
     resp.raise_for_status()
-    return f"Buscando descarga para S{ep_data['seasonNumber']:02d}E{ep_data['episodeNumber']:02d} '{ep_data.get('title', '')}'. Sonarr te notificará cuando esté listo."
+    return (
+        f"Buscando descarga para S{ep_data['seasonNumber']:02d}E{ep_data['episodeNumber']:02d} "
+        f"'{ep_data.get('title', '')}'. Sonarr te notificará cuando esté listo."
+    )
 
 
-# ── Definición de tools para Claude ────────────────────────
+# ── Declaración de tools para Gemini (function calling) ────
 
-TOOLS = [
-    {
-        "name": "search_movie",
-        "description": "Busca películas por nombre. Usar cuando el usuario quiere una película.",
-        "input_schema": {
+FUNCTION_DECLARATIONS = [
+    types.FunctionDeclaration(
+        name="search_movie",
+        description="Busca películas por nombre. Usar cuando el usuario quiere una película.",
+        parameters_json_schema={
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Nombre de la película a buscar",
-                }
+                "query": {"type": "string", "description": "Nombre de la película a buscar"}
             },
             "required": ["query"],
         },
-    },
-    {
-        "name": "add_movie",
-        "description": "Agrega una película para descargar. Usar después de confirmar cuál quiere el usuario.",
-        "input_schema": {
+    ),
+    types.FunctionDeclaration(
+        name="add_movie",
+        description="Agrega una película para descargar. Usar después de confirmar cuál quiere el usuario.",
+        parameters_json_schema={
             "type": "object",
             "properties": {
-                "tmdb_id": {
-                    "type": "integer",
-                    "description": "TMDB ID de la película",
-                }
+                "tmdb_id": {"type": "integer", "description": "TMDB ID de la película"}
             },
             "required": ["tmdb_id"],
         },
-    },
-    {
-        "name": "search_series",
-        "description": "Busca series de TV por nombre.",
-        "input_schema": {
+    ),
+    types.FunctionDeclaration(
+        name="search_series",
+        description="Busca series de TV por nombre.",
+        parameters_json_schema={
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Nombre de la serie a buscar",
-                }
+                "query": {"type": "string", "description": "Nombre de la serie a buscar"}
             },
             "required": ["query"],
         },
-    },
-    {
-        "name": "add_series",
-        "description": "Agrega una serie para descargar.",
-        "input_schema": {
+    ),
+    types.FunctionDeclaration(
+        name="add_series",
+        description="Agrega una serie completa para descargar.",
+        parameters_json_schema={
             "type": "object",
             "properties": {
-                "tvdb_id": {
-                    "type": "integer",
-                    "description": "TVDB ID de la serie",
-                }
+                "tvdb_id": {"type": "integer", "description": "TVDB ID de la serie"}
             },
             "required": ["tvdb_id"],
         },
-    },
-    {
-        "name": "search_episode",
-        "description": "Busca un episodio específico de una serie que ya está en Sonarr. Usar cuando el usuario pide un capítulo puntual.",
-        "input_schema": {
+    ),
+    types.FunctionDeclaration(
+        name="search_episode",
+        description=(
+            "Busca un episodio específico de una serie que ya está en Sonarr. "
+            "Usar cuando el usuario pide un capítulo puntual."
+        ),
+        parameters_json_schema={
             "type": "object",
             "properties": {
-                "tvdb_id": {
-                    "type": "integer",
-                    "description": "TVDB ID de la serie",
-                },
-                "season": {
-                    "type": "integer",
-                    "description": "Número de temporada",
-                },
-                "episode": {
-                    "type": "integer",
-                    "description": "Número de episodio",
-                },
+                "tvdb_id": {"type": "integer", "description": "TVDB ID de la serie"},
+                "season": {"type": "integer", "description": "Número de temporada"},
+                "episode": {"type": "integer", "description": "Número de episodio"},
             },
             "required": ["tvdb_id", "season", "episode"],
         },
-    },
-    {
-        "name": "download_episode",
-        "description": "Descarga un episodio específico. Usar después de search_episode cuando el usuario confirme.",
-        "input_schema": {
+    ),
+    types.FunctionDeclaration(
+        name="download_episode",
+        description="Descarga un episodio específico. Usar después de search_episode cuando el usuario confirme.",
+        parameters_json_schema={
             "type": "object",
             "properties": {
                 "episode_id": {
@@ -321,11 +338,11 @@ TOOLS = [
             },
             "required": ["episode_id"],
         },
-    },
+    ),
 ]
 
-SYSTEM_PROMPT = """Sos un asistente de media server. Ayudás al usuario a buscar y descargar 
-películas y series. 
+SYSTEM_PROMPT = """Sos un asistente de media server. Ayudás al usuario a buscar y descargar
+películas y series.
 
 Flujo para películas:
 1. El usuario pide algo (ej: "quiero ver Oppenheimer")
@@ -354,102 +371,138 @@ Reglas:
 - Todo se descarga en 1080p automáticamente
 """
 
+GENERATE_CONFIG = types.GenerateContentConfig(
+    system_instruction=SYSTEM_PROMPT,
+    tools=[types.Tool(function_declarations=FUNCTION_DECLARATIONS)],
+    temperature=0.3,
+    # No pasamos callables de Python, así que Gemini nunca ejecuta nada por su
+    # cuenta: siempre devuelve function_calls y el bot controla la ejecución.
+    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+)
+
+
+# ── Dispatch de tools ──────────────────────────────────────
+
+async def dispatch_tool(name: str, args: dict):
+    """Ejecuta la tool solicitada y devuelve un dict/list serializable."""
+    try:
+        if name == "search_movie":
+            return await search_movie(args["query"])
+        if name == "add_movie":
+            return await add_movie(int(args["tmdb_id"]))
+        if name == "search_series":
+            return await search_series(args["query"])
+        if name == "add_series":
+            return await add_series(int(args["tvdb_id"]))
+        if name == "search_episode":
+            return await search_episode(
+                int(args["tvdb_id"]), int(args["season"]), int(args["episode"])
+            )
+        if name == "download_episode":
+            return await download_episode(int(args["episode_id"]))
+        return {"error": f"Tool desconocido: {name}"}
+    except httpx.HTTPStatusError as e:
+        logger.error("HTTP %s en %s: %s", e.response.status_code, name, e)
+        return {"error": f"El servicio respondió {e.response.status_code}."}
+    except httpx.RequestError as e:
+        # Timeouts, conexión rechazada, servicio caído, etc.
+        logger.error("Fallo de red en %s: %s", name, e)
+        return {"error": "No pude contactar el servicio (timeout o caído). Intentá más tarde."}
+    except (KeyError, IndexError, ValueError) as e:
+        logger.error("Datos inesperados en %s: %s", name, e)
+        return {"error": f"Datos inválidos para {name}: {e}"}
+
+
+def _wrap_response(result) -> dict:
+    """Gemini exige que la respuesta de una tool sea un objeto JSON (dict)."""
+    if isinstance(result, dict):
+        return result
+    return {"result": result}
+
+
 # ── Historial de conversación por chat ─────────────────────
-conversations: dict[int, list] = {}
+# Guardamos objetos types.Content (formato nativo del SDK de Gemini).
+conversations: dict[int, list[types.Content]] = {}
+chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 MAX_HISTORY = 20
 
 
-def get_history(chat_id: int) -> list:
-    if chat_id not in conversations:
-        conversations[chat_id] = []
-    return conversations[chat_id]
+def get_history(chat_id: int) -> list[types.Content]:
+    return conversations.setdefault(chat_id, [])
 
 
-# ── Procesar con Claude ───────────────────────────────────
+def _is_user_text(content: types.Content) -> bool:
+    """True si es un turno de usuario de texto (no una respuesta de tool)."""
+    if getattr(content, "role", None) != "user":
+        return False
+    for part in content.parts or []:
+        if getattr(part, "function_response", None) is not None:
+            return False
+    return True
 
-def process_with_claude(chat_id: int, user_message: str) -> str:
-    history = get_history(chat_id)
-    history.append({"role": "user", "content": user_message})
 
-    # Mantener historial limitado
+def _trim_history(history: list[types.Content]) -> None:
+    """
+    Recorta el historial sin corromperlo: nunca lo deja empezando en un turno
+    del modelo ni en una respuesta de tool huérfana (sin su function_call).
+    Gemini requiere que la conversación arranque con un turno de usuario.
+    """
     if len(history) > MAX_HISTORY:
-        history[:] = history[-MAX_HISTORY:]
+        del history[:-MAX_HISTORY]
+    while history and not _is_user_text(history[0]):
+        history.pop(0)
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        system=SYSTEM_PROMPT,
-        tools=TOOLS,
-        messages=history,
+
+# ── Procesar con Gemini ────────────────────────────────────
+
+async def process_with_gemini(chat_id: int, user_message: str) -> str:
+    history = get_history(chat_id)
+    history.append(
+        types.Content(role="user", parts=[types.Part.from_text(text=user_message)])
+    )
+    _trim_history(history)
+
+    response = await gemini.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=history,
+        config=GENERATE_CONFIG,
     )
 
-    # Procesar tool calls en loop
-    while response.stop_reason == "tool_use":
-        # Obtener el bloque de tool use
-        tool_blocks = [b for b in response.content if b.type == "tool_use"]
-        text_blocks = [b for b in response.content if b.type == "text"]
+    # Loop de function calling controlado por nosotros.
+    guard = 0
+    while response.function_calls and guard < 10:
+        guard += 1
 
-        # Agregar respuesta del asistente al historial
-        history.append({"role": "assistant", "content": response.content})
+        # Turno del modelo (contiene los function_call): lo guardamos tal cual.
+        model_content = response.candidates[0].content
+        history.append(model_content)
 
-        # Ejecutar cada tool call
-        tool_results = []
-        for tool_block in tool_blocks:
-            tool_name = tool_block.name
-            tool_input = tool_block.input
-
-            logger.info(f"Tool call: {tool_name}({tool_input})")
-
-            try:
-                if tool_name == "search_movie":
-                    result = search_movie(tool_input["query"])
-                elif tool_name == "add_movie":
-                    result = add_movie(tool_input["tmdb_id"])
-                elif tool_name == "search_series":
-                    result = search_series(tool_input["query"])
-                elif tool_name == "add_series":
-                    result = add_series(tool_input["tvdb_id"])
-                elif tool_name == "search_episode":
-                    result = search_episode(
-                        tool_input["tvdb_id"],
-                        tool_input["season"],
-                        tool_input["episode"],
-                    )
-                elif tool_name == "download_episode":
-                    result = download_episode(tool_input["episode_id"])
-                else:
-                    result = {"error": f"Tool desconocido: {tool_name}"}
-            except Exception as e:
-                logger.error(f"Error en {tool_name}: {e}")
-                result = {"error": str(e)}
-
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
-                }
+        tool_parts = []
+        for fc in response.function_calls:
+            args = dict(fc.args or {})
+            logger.info("Tool call: %s(%s)", fc.name, args)
+            result = await dispatch_tool(fc.name, args)
+            tool_parts.append(
+                types.Part.from_function_response(
+                    name=fc.name,
+                    response=_wrap_response(result),
+                )
             )
 
-        history.append({"role": "user", "content": tool_results})
+        history.append(types.Content(role="tool", parts=tool_parts))
 
-        # Siguiente iteración con Claude
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=history,
+        response = await gemini.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=history,
+            config=GENERATE_CONFIG,
         )
 
-    # Extraer texto final
-    final_text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            final_text += block.text
+    final_text = (response.text or "").strip()
+    if response.candidates and response.candidates[0].content:
+        history.append(response.candidates[0].content)
+    _trim_history(history)
 
-    history.append({"role": "assistant", "content": response.content})
-    return final_text
+    return final_text or "No obtuve una respuesta. Probá de nuevo. 🤔"
 
 
 # ── Handlers de Telegram ──────────────────────────────────
@@ -469,27 +522,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_msg = update.message.text
 
-    # Indicador de "escribiendo..."
     await update.message.chat.send_action("typing")
 
-    try:
-        reply = process_with_claude(chat_id, user_msg)
-        await update.message.reply_text(reply)
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await update.message.reply_text(
-            "❌ Hubo un error procesando tu mensaje. Intentá de nuevo."
-        )
+    # Un lock por chat: distintos chats corren en paralelo (concurrent_updates),
+    # pero los mensajes de un mismo chat se serializan para no corromper su historial.
+    lock = chat_locks[chat_id]
+    async with lock:
+        try:
+            reply = await process_with_gemini(chat_id, user_msg)
+            await update.message.reply_text(reply)
+        except Exception as e:
+            logger.exception("Error procesando mensaje de %s: %s", chat_id, e)
+            await update.message.reply_text(
+                "❌ Hubo un error procesando tu mensaje. Intentá de nuevo."
+            )
+
+
+async def _on_shutdown(app) -> None:
+    await arr.aclose()
+    logger.info("Cliente HTTP cerrado.")
 
 
 # ── Main ──────────────────────────────────────────────────
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)  # procesa varios mensajes a la vez
+        .post_shutdown(_on_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot iniciado!")
+    logger.info("Bot iniciado con modelo %s", GEMINI_MODEL)
     app.run_polling()
 
 
