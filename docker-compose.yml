@@ -131,3 +131,24 @@ services:
       - 1080:1080
     volumes:
       - ./config/warp:/var/lib/cloudflare-warp
+
+  overseerr:
+    image: sctx/overseerr:latest
+    container_name: overseerr
+    environment:
+      - TZ=America/Bogota # Modifica esto según tu zona horaria
+    volumes:
+      - ./overseerr_config:/app/config
+    ports:
+      - 5055:5055
+    restart: unless-stopped
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./portainer_data:/data
+    ports:
+      - 9000:9000
+    restart: unless-stopped
