@@ -136,7 +136,7 @@ services:
     image: sctx/overseerr:latest
     container_name: overseerr
     environment:
-      - TZ=America/Bogota # Modifica esto según tu zona horaria
+      - TZ=America/Caracas
     volumes:
       - ./overseerr_config:/app/config
     ports:
