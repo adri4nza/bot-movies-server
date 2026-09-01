@@ -93,7 +93,7 @@ services:
   # TELEGRAM BOT — Bot con Inteligencia Artificial
   # ============================================
   telegram-bot:
-    build: ./telegram-bot
+    build: ./
     container_name: telegram-bot
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
