@@ -163,3 +163,18 @@ services:
       - ./homarr/data:/data
     ports:
       - '7575:7575'
+
+  jellyfin:
+    image: lscr.io/linuxserver/jellyfin:latest
+    container_name: jellyfin
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Caracas
+    volumes:
+      - ./jellyfin-config:/config
+      - ./media/tv:/data/tvshows
+      - ./media/movies:/data/movies
+    ports:
+      - 8096:8096
+    restart: unless-stopped
