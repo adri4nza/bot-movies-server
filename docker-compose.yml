@@ -185,3 +185,15 @@ services:
       - ./tailscale-config:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
     restart: unless-stopped
+
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    user: "1000:1000"
+    ports:
+      - "8085:80"
+    volumes:
+      - ~/:/srv
+      - ./filebrowser-db:/database
+    command: -d /database/filebrowser.db
+    restart: unless-stopped
