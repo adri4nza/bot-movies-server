@@ -197,3 +197,15 @@ services:
       - ./filebrowser-db:/database
     command: -d /database/filebrowser.db
     restart: unless-stopped
+
+  battery-api:
+    image: python:3.9-alpine
+    container_name: battery-api
+    restart: unless-stopped
+    volumes:
+      - ./battery_server.py:/app/battery_server.py:ro
+      - /sys/class/power_supply/BAT1:/sys/class/power_supply/BAT1:ro
+    ports:
+      - "8086:8086"
+    working_dir: /app
+    command: python3 battery_server.py
