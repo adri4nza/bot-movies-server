@@ -110,27 +110,27 @@ services:
   # ============================================
   # HERRAMIENTAS DE RED (Evasión de bloqueos)
   # ============================================
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: flaresolverr
-    environment:
-      - TZ=America/Caracas
-    ports:
-      - 8191:8191
-    restart: unless-stopped
+  # flaresolverr:
+  #   image: ghcr.io/flaresolverr/flaresolverr:latest
+  #   container_name: flaresolverr
+  #   environment:
+  #     - TZ=America/Caracas
+  #   ports:
+  #     - 8191:8191
+  #   restart: unless-stopped
 
-  warp:
-    image: caomingjun/warp:latest
-    container_name: warp
-    restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    environment:
-      - WARP_SLEEP=2
-    ports:
-      - 1080:1080
-    volumes:
-      - ./config/warp:/var/lib/cloudflare-warp
+  # warp:
+  #   image: caomingjun/warp:latest
+  #   container_name: warp
+  #   restart: unless-stopped
+  #   cap_add:
+  #     - NET_ADMIN
+  #   environment:
+  #     - WARP_SLEEP=2
+  #   ports:
+  #     - 1080:1080
+  #   volumes:
+  #     - ./config/warp:/var/lib/cloudflare-warp
 
   seerr:
     image: ghcr.io/seerr-team/seerr:latest
@@ -181,6 +181,8 @@ services:
     container_name: tailscale
     network_mode: "host"
     privileged: true
+    environment:
+      - TS_EPHEMERAL=false
     volumes:
       - ./tailscale-config:/var/lib/tailscale
       - /dev/net/tun:/dev/net/tun
